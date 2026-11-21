@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>CamTrack 3D — Camera Tracker</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d12;--panel:#141923;--line:#273244;--muted:#9aa8bb;--accent:#70a7ff;--good:#77d6a0}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf3fc;font:15px system-ui,Segoe UI,Arial}
+header{padding:22px max(18px,calc((100vw - 1100px)/2));border-bottom:1px solid var(--line);background:#10151e}
+h1{font-size:23px;margin:0 0 5px}header p{margin:0;color:var(--muted)}
+main{max-width:1100px;margin:auto;padding:18px;display:grid;grid-template-columns:minmax(0,1.2fr) minmax(280px,.8fr);gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:16px;min-width:0}
+h2{font-size:16px;margin:0 0 13px}.muted{color:var(--muted);font-size:13px;line-height:1.5}
+#viewer{height:360px;background:#080b10;border-radius:10px;overflow:hidden;position:relative}
+#viewer canvas{width:100%;height:100%;display:block}
+#video{width:100%;max-height:230px;background:#080b10;border-radius:10px;margin-top:12px}
+label{display:block;font-size:13px;color:var(--muted);margin:13px 0 6px}
+input,select,button{font:inherit}input[type=file],input[type=number],select{width:100%;background:#0c1119;color:#edf3fc;border:1px solid var(--line);padding:11px;border-radius:9px}
+button{border:0;border-radius:10px;padding:12px 15px;background:var(--accent);color:#07101e;font-weight:700;width:100%;margin-top:12px}
+button:disabled{opacity:.4}button.secondary{background:#263448;color:#eaf2ff}
+.row{display:flex;gap:10px}.row>*{flex:1}
+#status{margin-top:12px;padding:11px;background:#0c1119;border:1px solid var(--line);border-radius:9px;color:var(--muted);font-size:13px;min-height:42px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}
+.stat{background:#0c1119;padding:10px;border-radius:9px}.stat b{display:block;font-size:19px}.stat span{color:var(--muted);font-size:11px}
+.note{border-left:3px solid var(--accent);padding:9px 11px;background:#101c2c;border-radius:4px;color:#cbd9ed;font-size:12px;line-height:1.5;margin-top:12px}
+a{color:#a9caff}
+@media(max-width:760px){main{grid-template-columns:1fr;padding:12px}#viewer{height:300px}}
+</style>
+</head>
+<body>
+<header><h1>CamTrack 3D</h1><p>Seguimiento de cámara monocular · Previsualización 3D · Exportación FBX</p></header>
+<main>
+<section class="panel">
+<h2>Vista 3D de la trayectoria</h2>
+<div id="viewer"></div>
+<div class="stats">
+ <div class="stat"><b id="frames">0</b><span>Fotogramas procesados</span></div>
+ <div class="stat"><b id="tracked">0</b><span>Puntos rastreados</span></div>
+ <div class="stat"><b id="duration">0.0s</b><span>Duración analizada</span></div>
+</div>
+<label>Video de tu galería</label><input id="file" type="file" accept="video/*">
+<video id="video" controls playsinline></video>
+<div class="row">
+ <div><label>FPS de análisis</label><select id="fps"><option>8</option><option selected>12</option><option>15</option><option>24</option><option>30</option></select></div>
+ <div><label>Máximo de segundos</label><input id="limit" type="number" min="1" max="60" value="20"></div>
+</div>
+<button id="scan" disabled>Analizar movimiento de cámara</button>
+<div id="status">Cargando motor de visión artificial…</div>
+<div class="note">Consejo: graba una escena con objetos fijos y textura visible. Evita desenfoque fuerte, cambios bruscos de luz y personas u objetos que ocupen casi toda la imagen.</div>
+</section>
+<aside class="panel">
+<h2>Exportar movimiento</h2>
+<p class="muted">Cuando termine el análisis podrás exportar una cámara animada con claves de posición y rotación en un archivo FBX.</p>
+<label>Escala de traslación</label><input id="scale" type="number" min="0.01" max="1000" step="0.1" value="1">
+<p class="muted">La escala cambia el tamaño del recorrido estimado. No recupera metros reales.</p>
+<label>Nombre de la cámara</label><input id="camname" value="TrackedCamera">
+<button id="export" disabled>Exportar cámara FBX</button>
+<button id="csv" class="secondary" disabled>Exportar datos CSV</button>
+<div id="exportstatus" class="muted" style="margin-top:12px">Todavía no hay una trayectoria calculada.</div>
+<div class="note">El movimiento monocular tiene escala ambigua y puede acumular deriva. Esta versión es un prototipo de reconstrucción relativa, no sustituye un solucionador profesional de estructura desde movimiento (SfM).</div>
+</aside>
+</main>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script type="module">
+import * as THREE from 'https://esm.sh/three@0.180.0';
+import { exportFbx } from 'https://esm.sh/@comfyorg/fbx-exporter-three?external=three';
+
+const $=id=>document.getElementById(id);
+let cvReady=false, videoUrl=null, renderer, scene, viewCamera, pathLine, cameraMarker;
+let solved=[], pointCount=0, videoFile=null;
+function status(s){$('status').textContent=s}
+function exportStatus(s){$('exportstatus').textContent=s}
+window.opencvReady=()=>{};
+(function waitForOpenCV(){if(window.cv&&cv.Mat){cvReady=true;status('Motor listo. Selecciona un video para comenzar.');$('scan').disabled=!videoFile}else setTimeout(waitForOpenCV,250)})();
+function init3D(){
+ const host=$('viewer');scene=new THREE.Scene();scene.background=new THREE.Color(0x080b10);
+ viewCamera=new THREE.PerspectiveCamera(50,1,.01,10000);viewCamera.position.set(4,3,6);viewCamera.lookAt(0,0,0);
+ renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio,2));host.appendChild(renderer.domElement);
+ scene.add(new THREE.GridHelper(10,20,0x40516b,0x202b3b));
+ scene.add(new THREE.AxesHelper(1.5));
+ const light=new THREE.HemisphereLight(0xffffff,0x334455,2);scene.add(light);
+ cameraMarker=new THREE.Group();
+ const body=new THREE.Mesh(new THREE.BoxGeometry(.22,.14,.3),new THREE.MeshStandardMaterial({color:0x70a7ff}));
+ cameraMarker.add(body);
+ const nose=new THREE.Mesh(new THREE.ConeGeometry(.09,.2,12),new THREE.MeshStandardMaterial({color:0xffc36b}));
+ nose.rotation.x=Math.PI/2;nose.position.z=-.23;cameraMarker.add(nose);scene.add(cameraMarker);
+ const resize=()=>{const w=host.clientWidth,h=host.clientHeight;renderer.setSize(w,h,false);viewCamera.aspect=w/h;viewCamera.updateProjectionMatrix()};
+ new ResizeObserver(resize).observe(host);resize();
+ (function loop(){requestAnimationFrame(loop);renderer.render(scene,viewCamera)})();
+}
+init3D();
+function drawPath(){
+ if(pathLine)scene.remove(pathLine);
+ const pts=solved.map(p=>new THREE.Vector3(p.pos[0],p.pos[1],p.pos[2]));
+ if(pts.length>1){pathLine=new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({color:0x70a7ff}));scene.add(pathLine)}
+ if(pts.length){cameraMarker.position.copy(pts[pts.length-1]);cameraMarker.quaternion.set(...solved[solved.length-1].quat)}
+}
+$('file').addEventListener('change',e=>{
+ videoFile=e.target.files[0];if(!videoFile)return;
+ if(videoUrl)URL.revokeObjectURL(videoUrl);videoUrl=URL.createObjectURL(videoFile);$('video').src=videoUrl;
+ $('scan').disabled=!cvReady;solved=[];$('export').disabled=true;$('csv').disabled=true;exportStatus('Video cargado. Analiza el movimiento para generar la trayectoria.');status(cvReady?'Video listo.':'Esperando a que cargue OpenCV…');
+});
+function matToPoints(mat){const a=[];for(let i=0;i<mat.rows;i++)a.push(new cv.Point2(mat.data32F[i*2],mat.data32F[i*2+1]));return a}
+function matFromPoints(points){const m=cv.matFromArray(points.length,1,cv.CV_32FC2,points.flatMap(p=>[p.x,p.y]));return m}
+async function analyze(){
+ if(!cvReady||!videoFile)return;
+ $('scan').disabled=true;$('export').disabled=true;$('csv').disabled=true;solved=[];pointCount=0;
+ const v=$('video');v.pause();await new Promise((resolve,reject)=>{if(v.readyState>=2)resolve();else{v.onloadeddata=resolve;v.onerror=reject}});
+ const fps=Number($('fps').value),limit=Math.min(60,Math.max(1,Number($('limit').value)||20));
+ const w=Math.min(640,v.videoWidth),h=Math.round(v.videoHeight*w/v.videoWidth);
+ const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;const ctx=canvas.getContext('2d',{willReadFrequently:true});
+ const K=cv.matFromArray(3,3,cv.CV_64F,[1.2*w,0,w/2,0,1.2*w,h/2,0,0,1]);
+ let prevGray=null,prevPts=null,worldPos=new THREE.Vector3(),worldQuat=new THREE.Quaternion();
+ let processed=0,okPairs=0;const total=Math.min(Math.floor(limit*fps),Math.ceil(v.duration*fps));
+ const gray=new cv.Mat(h,w,cv.CV_8UC1);
+ try{
+  for(let i=0;i<total;i++){
+   const t=Math.min(i/fps,Math.max(0,v.duration-.001));
+   if(Math.abs(v.currentTime-t)>0.015) await new Promise(resolve=>{v.onseeked=resolve;v.currentTime=t});
+   ctx.drawImage(v,0,0,w,h);
+   const rgba=cv.matFromImageData(ctx.getImageData(0,0,w,h));cv.cvtColor(rgba,gray,cv.COLOR_RGBA2GRAY);rgba.delete();
+   if(prevGray===null){
+    prevGray=gray.clone();const corners=new cv.Mat();
+    cv.goodFeaturesToTrack(gray,corners,700,.01,8);
+    prevPts=matToPoints(corners);corners.delete();
+    solved.push({time:t,pos:[0,0,0],quat:[0,0,0,1]});processed++;continue;
+   }
+   const p0=matFromPoints(prevPts),p1=new cv.Mat(),st=new cv.Mat(),err=new cv.Mat();
+   cv.calcOpticalFlowPyrLK(prevGray,gray,p0,p1,st,err,new cv.Size(21,21),3);
+   let oldGood=[],newGood=[];
+   for(let j=0;j<st.rows;j++)if(st.data[j]){oldGood.push(prevPts[j]);newGood.push(new THREE.Vector2(p1.data32F[j*2],p1.data32F[j*2+1]))}
+   p0.delete();p1.delete();st.delete();err.delete();
+   let success=false;
+   if(newGood.length>=12){
+    const a=matFromPoints(oldGood),b=matFromPoints(newGood),mask=new cv.Mat(),R=new cv.Mat(),T=new cv.Mat();
+    let E=null;
+    try{
+     E=cv.findEssentialMat(a,b,K,cv.RANSAC,.999,1.5,mask);
+     if(!E.empty()){
+      const inliers=cv.recoverPose(E,a,b,K,R,T,mask);
+      if(inliers>=8){
+       const r=R.data64F, tq=T.data64F;
+       const relR=new THREE.Matrix4().set(r[0],r[1],r[2],0,r[3],r[4],r[5],0,r[6],r[7],r[8],0,0,0,0,1);
+       const relQ=new THREE.Quaternion().setFromRotationMatrix(relR).invert();
+       worldQuat.multiply(relQ).normalize();
+       const tr=new THREE.Vector3(tq[0],tq[1],tq[2]).applyQuaternion(worldQuat);
+       worldPos.sub(tr);
+       success=true;okPairs++;pointCount=newGood.length;
+      }
+     }
+    }catch(e){console.warn(e)}
+    if(E)E.delete();a.delete();b.delete();mask.delete();R.delete();T.delete();
+   }
+   solved.push({time:t,pos:worldPos.toArray(),quat:worldQuat.toArray()});
+   // Re-detect each frame to reduce track loss; relative pose only advances when solve succeeds.
+   const corners=new cv.Mat();cv.goodFeaturesToTrack(gray,corners,700,.01,8);
+   prevPts=matToPoints(corners);corners.delete();
+   prevGray.delete();prevGray=gray.clone();processed++;
+   if(i%4===0){$('frames').textContent=processed;$('tracked').textContent=pointCount;$('duration').textContent=t.toFixed(1)+'s';status(`Analizando ${processed}/${total} fotogramas · ${okPairs} estimaciones válidas…`);drawPath();await new Promise(r=>setTimeout(r,0))}
+  }
+ }catch(err){status('Error durante el análisis: '+err.message);console.error(err)}
+ finally{if(prevGray)prevGray.delete();if(gray)gray.delete();K.delete()}
+ $('frames').textContent=processed;$('tracked').textContent=pointCount;$('duration').textContent=(solved.at(-1)?.time||0).toFixed(1)+'s';
+ drawPath();
+ if(okPairs===0){status('No se pudo resolver el movimiento. Prueba un video con más textura, luz y movimiento suave.');exportStatus('No hay una solución de cámara fiable para exportar.')}
+ else{status(`Análisis terminado. ${okPairs} pares de fotogramas aportaron movimiento estimado.`);$('export').disabled=false;$('csv').disabled=false;exportStatus('Trayectoria lista. Puedes exportar el FBX o los datos CSV.')}
+ $('scan').disabled=false;
+}
+$('scan').addEventListener('click',analyze);
+function buildScene(){
+ const exportScene=new THREE.Scene();const cam=new THREE.PerspectiveCamera(50,1,.01,10000);cam.name=$('camname').value.trim()||'TrackedCamera';exportScene.add(cam);
+ const scale=Math.max(.01,Number($('scale').value)||1),times=[],positions=[],rotations=[];
+ for(const p of solved){times.push(p.time);positions.push(p.pos[0]*scale,p.pos[1]*scale,p.pos[2]*scale);rotations.push(...p.quat)}
+ const clip=new THREE.AnimationClip('CameraMotion',-1,[
+  new THREE.VectorKeyframeTrack(cam.name+'.position',times,positions),
+  new THREE.QuaternionKeyframeTrack(cam.name+'.quaternion',times,rotations)
+ ]);
+ exportScene.animations=[clip];return {exportScene,clip};
+}
+$('export').addEventListener('click',async()=>{
+ if(!solved.length)return;
+ try{
+  exportStatus('Generando archivo FBX…');
+  const {exportScene,clip}=buildScene();
+  const bytes=exportFbx(exportScene,{animations:[clip],fps:Number($('fps').value),target:'blender',includeAnimations:true});
+  const blob=new Blob([bytes],{type:'application/octet-stream'}),url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download='camera_tracking.fbx';a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);
+  exportStatus('FBX generado. Comprueba la orientación y escala al importarlo en Prisma3D.');
+ }catch(e){console.error(e);exportStatus('No se pudo exportar FBX: '+e.message)}
+});
+$('csv').addEventListener('click',()=>{
+ const rows=['time,x,y,z,qx,qy,qz,qw'];
+ for(const p of solved)rows.push([p.time,...p.pos,...p.quat].join(','));
+ const blob=new Blob([rows.join('\n')],{type:'text/csv'}),url=URL.createObjectURL(blob);
+ const a=document.createElement('a');a.href=url;a.download='camera_tracking.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);
+});
+</script>
+</body>
+</html>
